@@ -144,11 +144,33 @@ def _build_info(
 class SigningCredentials:
     """Assinador pyHanko + metadados, sem expor chave, senha ou Base64."""
 
-    __slots__ = ("_signer", "_info")
+    __slots__ = ("_signer", "_info", "_trust_roots", "_intermediates")
 
-    def __init__(self, signer: "signers.SimpleSigner", info: CertificateInfo) -> None:
+    def __init__(
+        self,
+        signer: "signers.SimpleSigner",
+        info: CertificateInfo,
+        trust_roots: tuple[Any, ...] = (),
+        intermediates: tuple[Any, ...] = (),
+    ) -> None:
         self._signer = signer
         self._info = info
+        self._trust_roots = trust_roots
+        self._intermediates = intermediates
+
+    @property
+    def trust_roots(self) -> tuple[Any, ...]:
+        """Âncoras de confiança (``asn1crypto.x509.Certificate``) para validar assinaturas.
+
+        Contém o próprio certificado de assinatura (pinning) e as raízes autoassinadas da
+        cadeia do PKCS#12. Nunca inclui certificados vindos de PDFs enviados por terceiros.
+        """
+        return self._trust_roots or (self._signer.signing_cert,)
+
+    @property
+    def intermediates(self) -> tuple[Any, ...]:
+        """Certificados intermediários da cadeia (``asn1crypto.x509.Certificate``)."""
+        return self._intermediates
 
     @property
     def signer(self) -> "signers.SimpleSigner":
@@ -269,6 +291,24 @@ def _build_signer(
     )
 
 
+def _build_trust_material(
+    cert: x509.Certificate, chain: list[x509.Certificate]
+) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+    """Separa a cadeia em âncoras (certificado de assinatura + raízes) e intermediários."""
+    from asn1crypto import x509 as asn1_x509
+
+    der = serialization.Encoding.DER
+
+    def load(item: x509.Certificate) -> Any:
+        return asn1_x509.Certificate.load(item.public_bytes(der))
+
+    roots = [load(cert)]
+    intermediates: list[Any] = []
+    for extra in chain:
+        (roots if extra.issuer == extra.subject else intermediates).append(load(extra))
+    return tuple(roots), tuple(intermediates)
+
+
 def load_signing_credentials_from_bytes(
     pfx_data: bytes, password: bytes | None
 ) -> SigningCredentials:
@@ -296,7 +336,14 @@ def load_signing_credentials_from_bytes(
     except Exception:  # noqa: BLE001 - nada do material de chave pode vazar na mensagem
         raise CertificateLoadError("Falha ao inicializar o assinador com o certificado") from None
 
-    credentials = SigningCredentials(signer, _build_info(cert, key, len(chain)))
+    try:
+        trust_roots, intermediates = _build_trust_material(cert, chain)
+    except Exception:  # noqa: BLE001 - nada do material de chave pode vazar na mensagem
+        raise CertificateLoadError("Falha ao preparar a cadeia de confiança do certificado") from None
+
+    credentials = SigningCredentials(
+        signer, _build_info(cert, key, len(chain)), trust_roots, intermediates
+    )
     info = credentials.info
     logger.info(
         "Certificado de assinatura carregado: serial=%s sha256=%s validade=%s..%s cadeia=%d",

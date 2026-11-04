@@ -11,8 +11,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import health
 from app.api.middleware import MaxBodySizeMiddleware
-from app.api.v1 import certificates
+from app.api.v1 import certificates, validation
 from app.core.config import Settings, get_settings
+from app.crypto.inspector import PyHankoPdfInspector
 from app.crypto.provider import get_signing_credentials
 from app.crypto.signing_service import PadesSigningService
 from app.repositories.certificate_repository import CertificateRepository
@@ -20,8 +21,12 @@ from app.services.batch_issuance import BatchIssuanceService
 from app.services.certificate_renderer import CertificateRenderer
 from app.services.database import Database
 from app.services.storage import ObjectStorage
+from app.services.validation_service import ValidationService
 
 logger = logging.getLogger(__name__)
+
+# Folga para delimitadores/cabeçalhos do multipart além dos bytes do arquivo.
+_MULTIPART_OVERHEAD_BYTES = 4096
 
 
 def _configure_logging(level: str) -> None:
@@ -58,6 +63,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             renderer, signer, storage, repository, concurrency=settings.batch_concurrency
         )
 
+        app.state.validation_service = ValidationService(
+            repository,
+            storage,
+            PyHankoPdfInspector(credentials),
+            presign_ttl_seconds=settings.validation_presigned_ttl_seconds,
+            concurrency=settings.validation_concurrency,
+            timeout_seconds=settings.validation_timeout_seconds,
+        )
+
         health_status = credentials.healthcheck()
         if not health_status.ok:
             logger.error("Emissão bloqueada: %s", health_status.message)
@@ -92,8 +106,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         max_bytes=resolved.batch_max_body_bytes,
         path_prefix=f"{resolved.api_v1_prefix}/certificates",
     )
+    # Upload da perícia pública: corpo = arquivo + pequena sobra de multipart, sempre < 1 MiB (RAM).
+    app.add_middleware(
+        MaxBodySizeMiddleware,
+        max_bytes=resolved.validation_max_upload_bytes + _MULTIPART_OVERHEAD_BYTES,
+        path_prefix=f"{resolved.api_v1_prefix}/validate/file",
+    )
     app.include_router(health.router)
     app.include_router(certificates.router, prefix=resolved.api_v1_prefix)
+    app.include_router(validation.router, prefix=resolved.api_v1_prefix)
     return app
 
 

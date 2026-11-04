@@ -5,6 +5,8 @@ Códigos de resposta de ambos os endpoints:
 - ``207``: houve falhas por item (inspecione ``results``; os demais foram emitidos);
 - ``401``/``503``: chave ausente/inválida, ou emissão desabilitada/indisponível;
 - ``413``/``415``/``422``: corpo grande demais, arquivo que não é CSV, dados inválidos.
+
+Também aqui (Etapa 5): ``POST /certificates/{cert_uuid}/revoke`` revoga um certificado emitido.
 """
 
 from __future__ import annotations
@@ -12,10 +14,18 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Annotated, Any
 
+from uuid import UUID
+
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile, status
 from pydantic import ValidationError
 
-from app.api.deps import IssuanceServiceDep, SettingsDep, build_audit_context, require_api_key
+from app.api.deps import (
+    IssuanceServiceDep,
+    SettingsDep,
+    ValidationServiceDep,
+    build_audit_context,
+    require_api_key,
+)
 from app.core.config import Settings
 from app.crypto.errors import CertificateValidityError
 from app.schemas.certificate import CertificateRenderData
@@ -27,7 +37,14 @@ from app.schemas.issuance import (
     build_render_items,
 )
 from app.services.batch_issuance import BatchIssuanceService
+from app.repositories.errors import RepositoryUnavailableError
+from app.schemas.validation import RevokeRequest, RevokeResponse
 from app.services.csv_parser import CsvFormatError, parse_participants_csv
+
+# Literais numéricos: o Starlette renomeou HTTP_422_UNPROCESSABLE_ENTITY e HTTP_413_REQUEST_ENTITY_TOO_LARGE
+# em versões recentes; os números funcionam em todas.
+_HTTP_413 = 413
+_HTTP_422 = 422
 
 router = APIRouter(
     prefix="/certificates",
@@ -43,14 +60,14 @@ router = APIRouter(
 def _ensure_batch_size(count: int, settings: Settings) -> None:
     if count > settings.batch_max_items:
         raise HTTPException(
-            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            _HTTP_413,
             f"O lote excede o limite de {settings.batch_max_items} participantes",
         )
 
 
 def _unprocessable(message: str, errors: list[dict[str, str]]) -> HTTPException:
     detail: dict[str, Any] = {"message": message, "errors": errors}
-    return HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail)
+    return HTTPException(_HTTP_422, detail)
 
 
 async def _issue(
@@ -129,7 +146,7 @@ async def issue_batch_csv(
     raw = await file.read(settings.batch_max_body_bytes + 1)
     await file.close()
     if len(raw) > settings.batch_max_body_bytes:
-        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "Arquivo CSV grande demais")
+        raise HTTPException(_HTTP_413, "Arquivo CSV grande demais")
 
     try:
         event = EventInfo(
@@ -155,3 +172,38 @@ async def issue_batch_csv(
     except ParticipantValidationError as exc:
         raise _unprocessable("Há linhas inválidas no CSV", exc.errors) from None
     return await _issue(items, request, response, service, settings)
+
+
+@router.post(
+    "/{cert_uuid}/revoke",
+    response_model=RevokeResponse,
+    summary="Revoga um certificado emitido",
+    description=(
+        "Marca o certificado como REVOGADO. A ação é irreversível por esta API e fica registrada "
+        "na auditoria. Depois dela, a consulta por código e a perícia de arquivo passam a "
+        "responder `REVOKED`. O motivo é guardado apenas no banco e não aparece nas rotas públicas."
+    ),
+    responses={
+        404: {"description": "Certificado não encontrado"},
+        409: {"description": "Certificado já estava revogado"},
+    },
+)
+async def revoke_certificate(
+    cert_uuid: UUID,
+    payload: RevokeRequest,
+    request: Request,
+    service: ValidationServiceDep,
+    settings: SettingsDep,
+) -> RevokeResponse:
+    context = build_audit_context(request, settings)
+    try:
+        result = await service.revoke(cert_uuid, payload.sanitized_reason(), context)
+    except RepositoryUnavailableError:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "Banco de dados indisponível. Tente novamente."
+        ) from None
+    if result.outcome == "not_found":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Certificado não encontrado")
+    if result.outcome == "already_revoked" or result.revoked_at is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "O certificado já está revogado")
+    return RevokeResponse(cert_uuid=cert_uuid, revoked_at=result.revoked_at)

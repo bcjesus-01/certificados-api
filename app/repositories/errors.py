@@ -22,3 +22,7 @@ class PersistenceError(RepositoryError):
     def __init__(self, message: str, *, definitive: bool) -> None:
         super().__init__(message)
         self.definitive = definitive
+
+
+class RepositoryUnavailableError(RepositoryError):
+    """Banco de dados inacessível ou com falha numa operação de leitura/escrita simples."""

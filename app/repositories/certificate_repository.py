@@ -7,14 +7,25 @@ ou os dois existem, ou nenhum. O log de auditoria é append-only (triggers do SQ
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from typing import Any
 from uuid import UUID
 
 import asyncpg
 from asyncpg import exceptions as pg_exc
 
-from app.repositories.errors import DuplicateCertificateError, PersistenceError
-from app.repositories.models import AuditContext, IssuedCertificate
+from app.repositories.errors import (
+    DuplicateCertificateError,
+    PersistenceError,
+    RepositoryUnavailableError,
+)
+from app.repositories.models import (
+    AuditContext,
+    AuditEvent,
+    CertificateRecord,
+    IssuedCertificate,
+    RevocationResult,
+)
 from app.services.database import Database, DatabaseError
 
 logger = logging.getLogger(__name__)
@@ -38,6 +49,48 @@ insert into public.certificate_audit_log
     (certificate_id, action, outcome, client_ip_hash, user_agent, details)
 values (null, 'issued', 'error', $1, $2, $3)
 """
+
+_SELECT_RECORD = """
+select id, participant_name, recipient_doc, role, event_name, event_date_label,
+       workload_hours, issued_at, signed_at, pdf_sha256, storage_bucket, storage_key,
+       signer_fingerprint, status::text as status, revoked_at
+from public.certificates
+"""
+
+_INSERT_AUDIT_EVENT = """
+insert into public.certificate_audit_log
+    (certificate_id, action, outcome, client_ip_hash, user_agent, details)
+values ($1, $2, $3, $4, $5, $6)
+"""
+
+_REVOKE = """
+update public.certificates
+   set status = 'revoked', revoked_at = now(), revoked_reason = $2
+ where id = $1 and status = 'valid'
+returning revoked_at
+"""
+
+_READ_ERRORS = (pg_exc.PostgresError, asyncpg.InterfaceError, OSError, DatabaseError)
+
+
+def _to_record(row: asyncpg.Record) -> CertificateRecord:
+    return CertificateRecord(
+        id=row["id"],
+        participant_name=row["participant_name"],
+        recipient_doc=row["recipient_doc"],
+        role=row["role"],
+        event_name=row["event_name"],
+        event_date_label=row["event_date_label"],
+        workload_hours=row["workload_hours"],
+        issued_at=row["issued_at"],
+        signed_at=row["signed_at"],
+        pdf_sha256=row["pdf_sha256"],
+        storage_bucket=row["storage_bucket"],
+        storage_key=row["storage_key"],
+        signer_fingerprint=row["signer_fingerprint"],
+        status=row["status"],
+        revoked_at=row["revoked_at"],
+    )
 
 
 class CertificateRepository:
@@ -103,3 +156,78 @@ class CertificateRepository:
         await self._db.execute(
             _INSERT_AUDIT_FAILURE, context.client_ip_hash, context.user_agent, details
         )
+
+    # ------------------------------------------------------------------
+    # Consultas (Etapa 5)
+    # ------------------------------------------------------------------
+    async def get_by_id(self, cert_id: UUID) -> CertificateRecord | None:
+        try:
+            row = await self._db.fetch_one(f"{_SELECT_RECORD} where id = $1", cert_id)
+        except _READ_ERRORS as exc:
+            logger.error("Falha ao consultar certificado por id: %s", type(exc).__name__)
+            raise RepositoryUnavailableError("Banco de dados indisponível") from exc
+        return _to_record(row) if row is not None else None
+
+    async def get_by_sha256(self, file_sha256: str) -> CertificateRecord | None:
+        """Busca pelo hash do PDF assinado (índice único ``certificates_pdf_sha256_key``)."""
+        try:
+            row = await self._db.fetch_one(f"{_SELECT_RECORD} where pdf_sha256 = $1", file_sha256)
+        except _READ_ERRORS as exc:
+            logger.error("Falha ao consultar certificado por hash: %s", type(exc).__name__)
+            raise RepositoryUnavailableError("Banco de dados indisponível") from exc
+        return _to_record(row) if row is not None else None
+
+    async def record_audit(self, events: Sequence[AuditEvent], context: AuditContext) -> None:
+        """Grava eventos de auditoria numa única transação. Pode lançar ``RepositoryUnavailableError``."""
+        if not events:
+            return
+        try:
+            async with self._db.transaction() as conn:
+                for event in events:
+                    await conn.execute(
+                        _INSERT_AUDIT_EVENT,
+                        event.certificate_id,
+                        event.action,
+                        event.outcome,
+                        context.client_ip_hash,
+                        context.user_agent,
+                        event.details,
+                    )
+        except _READ_ERRORS as exc:
+            logger.error("Falha ao gravar auditoria: %s", type(exc).__name__)
+            raise RepositoryUnavailableError("Banco de dados indisponível") from exc
+
+    async def revoke(
+        self, cert_id: UUID, reason: str, context: AuditContext
+    ) -> RevocationResult:
+        """Revoga o certificado e audita a tentativa na MESMA transação (atômico).
+
+        O motivo fica apenas em ``certificates.revoked_reason``: o log de auditoria é
+        append-only e não permitiria corrigir/apagar dados pessoais digitados no texto livre.
+        """
+        try:
+            async with self._db.transaction() as conn:
+                revoked_at = await conn.fetchval(_REVOKE, cert_id, reason)
+                if revoked_at is not None:
+                    result = RevocationResult("revoked", revoked_at)
+                else:
+                    current = await conn.fetchval(
+                        "select status::text from public.certificates where id = $1", cert_id
+                    )
+                    result = RevocationResult("not_found" if current is None else "already_revoked")
+                outcome = {"revoked": "success", "not_found": "not_found"}.get(
+                    result.outcome, "invalid"
+                )
+                await conn.execute(
+                    _INSERT_AUDIT_EVENT,
+                    cert_id if result.outcome != "not_found" else None,
+                    "revoked",
+                    outcome,
+                    context.client_ip_hash,
+                    context.user_agent,
+                    {"result": result.outcome, "cert_uuid": str(cert_id)},
+                )
+        except _READ_ERRORS as exc:
+            logger.error("Falha ao revogar certificado: %s", type(exc).__name__)
+            raise RepositoryUnavailableError("Banco de dados indisponível") from exc
+        return result

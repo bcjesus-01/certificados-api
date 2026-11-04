@@ -46,6 +46,16 @@ class Settings(BaseSettings):
     # grava o upload em arquivo temporário (SpooledTemporaryFile), violando o "zero disco".
     batch_max_body_bytes: int = Field(default=900_000, ge=10_000, le=1_000_000)
 
+    # --- Validação pública (Etapa 5) ---
+    # Teto do PDF enviado em POST /validate/file. Mantido abaixo de 1 MiB: acima disso o Starlette
+    # gravaria o upload em arquivo temporário (SpooledTemporaryFile), violando o "zero disco".
+    validation_max_upload_bytes: int = Field(default=1_000_000, ge=10_000, le=1_000_000)
+    # Validade da URL pré-assinada devolvida pela consulta por código/QR Code.
+    validation_presigned_ttl_seconds: int = Field(default=900, ge=30, le=3600)
+    # Perícias de PDF simultâneas (trabalho de CPU em threads) e tempo máximo de cada uma.
+    validation_concurrency: int = Field(default=4, ge=1, le=32)
+    validation_timeout_seconds: float = Field(default=20.0, ge=1.0, le=120.0)
+
     # --- Banco de dados (Supabase / PostgreSQL) ---
     database_url: SecretStr
     db_ssl: Literal["disable", "prefer", "require", "verify-ca", "verify-full"] = "require"

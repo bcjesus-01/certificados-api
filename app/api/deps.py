@@ -14,6 +14,7 @@ from fastapi.security import APIKeyHeader
 from app.core.config import Settings, get_settings
 from app.repositories.models import AuditContext
 from app.services.batch_issuance import BatchIssuanceService
+from app.services.validation_service import ValidationService
 
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 
@@ -54,6 +55,16 @@ def get_issuance_service(request: Request) -> BatchIssuanceService:
 
 
 IssuanceServiceDep = Annotated[BatchIssuanceService, Depends(get_issuance_service)]
+
+
+def get_validation_service(request: Request) -> ValidationService:
+    service: ValidationService | None = getattr(request.app.state, "validation_service", None)
+    if service is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Serviço de validação indisponível")
+    return service
+
+
+ValidationServiceDep = Annotated[ValidationService, Depends(get_validation_service)]
 
 
 def build_audit_context(request: Request, settings: Settings) -> AuditContext:
