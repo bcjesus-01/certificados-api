@@ -142,6 +142,25 @@ class ObjectStorage:
         except (BotoCoreError, ClientError) as exc:
             raise StorageError("Falha ao gerar URL pré-assinada") from exc
 
+    def _download_sync(self, key: str, max_bytes: int) -> bytes:
+        response = self._client.get_object(Bucket=self._bucket, Key=key)
+        try:
+            if int(response.get("ContentLength", 0)) > max_bytes:
+                raise StorageError("Objeto maior que o limite permitido")
+            return bytes(response["Body"].read())
+        finally:
+            response["Body"].close()
+
+    async def download(self, key: str, max_bytes: int = 25 * 1024 * 1024) -> bytes:
+        """Baixa o objeto direto para a RAM (sem arquivo temporário)."""
+        self._validate_key(key)
+        try:
+            return await asyncio.to_thread(self._download_sync, key, max_bytes)
+        except StorageError:
+            raise
+        except (BotoCoreError, ClientError) as exc:
+            raise StorageError("Falha ao baixar o objeto do storage") from exc
+
     async def exists(self, key: str) -> bool:
         self._validate_key(key)
         try:

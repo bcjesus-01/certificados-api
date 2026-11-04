@@ -38,6 +38,14 @@ class Settings(BaseSettings):
     )
     batch_max_items: int = Field(default=500, ge=1, le=5000)
 
+    # --- API de emissão em lote (Etapa 4) ---
+    # Sem a chave, os endpoints de emissão respondem 503 (falham fechados).
+    issuance_api_key: SecretStr | None = None
+    batch_concurrency: int = Field(default=4, ge=1, le=32)
+    # Corpo máximo das requisições de lote. Mantido abaixo de 1 MiB: acima disso o Starlette
+    # grava o upload em arquivo temporário (SpooledTemporaryFile), violando o "zero disco".
+    batch_max_body_bytes: int = Field(default=900_000, ge=10_000, le=1_000_000)
+
     # --- Banco de dados (Supabase / PostgreSQL) ---
     database_url: SecretStr
     db_ssl: Literal["disable", "prefer", "require", "verify-ca", "verify-full"] = "require"
@@ -93,6 +101,24 @@ class Settings(BaseSettings):
             return None
         return value
 
+    @field_validator("issuance_api_key", mode="before")
+    @classmethod
+    def _empty_issuance_key_is_none(cls, value: object) -> object:
+        if isinstance(value, str):
+            value = value.strip()
+            return value or None
+        return value
+
+    @field_validator("issuance_api_key", mode="after")
+    @classmethod
+    def _validate_issuance_key(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is not None and len(value.get_secret_value()) < 32:
+            raise ValueError(
+                "ISSUANCE_API_KEY deve ter ao menos 32 caracteres "
+                '(gere com: python -c "import secrets; print(secrets.token_urlsafe(48))")'
+            )
+        return value
+
     @field_validator("s3_key_prefix")
     @classmethod
     def _validate_key_prefix(cls, value: str) -> str:
@@ -123,6 +149,8 @@ class Settings(BaseSettings):
                 raise ValueError("Em produção DB_SSL deve ser require, verify-ca ou verify-full")
             if not self.public_validation_base_url.startswith("https://"):
                 raise ValueError("Em produção PUBLIC_VALIDATION_BASE_URL deve usar https://")
+            if self.issuance_api_key is None:
+                raise ValueError("Em produção ISSUANCE_API_KEY é obrigatória")
         return self
 
     @property
