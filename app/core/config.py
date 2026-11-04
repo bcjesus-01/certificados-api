@@ -1,0 +1,136 @@
+"""Configuração da aplicação via variáveis de ambiente (pydantic-settings).
+
+Nenhum segredo é logado: credenciais usam ``SecretStr``.
+"""
+
+from __future__ import annotations
+
+import base64
+import binascii
+import re
+from functools import lru_cache
+from typing import Literal
+
+from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+class Settings(BaseSettings):
+    """Configurações tipadas e validadas na inicialização (fail-fast)."""
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        case_sensitive=False,
+    )
+
+    # --- Aplicação ---
+    app_name: str = "certificados-api"
+    app_env: Literal["development", "staging", "production"] = "development"
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+    api_v1_prefix: str = "/api/v1"
+    cors_allowed_origins: list[str] = Field(default_factory=list)
+    public_validation_base_url: str = Field(
+        ..., description="URL base do portal de validação (usada no QR Code)."
+    )
+    batch_max_items: int = Field(default=500, ge=1, le=5000)
+
+    # --- Banco de dados (Supabase / PostgreSQL) ---
+    database_url: SecretStr
+    db_ssl: Literal["disable", "prefer", "require", "verify-ca", "verify-full"] = "require"
+    db_pool_min_size: int = Field(default=2, ge=1, le=50)
+    db_pool_max_size: int = Field(default=10, ge=1, le=100)
+    db_command_timeout: float = Field(default=30.0, gt=0)
+    # 0 é obrigatório atrás do pooler em modo transaction (Supavisor/pgbouncer).
+    db_statement_cache_size: int = Field(default=0, ge=0)
+
+    # --- Object Storage (Cloudflare R2 / AWS S3) ---
+    s3_endpoint_url: str | None = None
+    s3_region: str = "auto"
+    s3_access_key_id: SecretStr
+    s3_secret_access_key: SecretStr
+    s3_bucket: str = Field(..., min_length=3, max_length=63)
+    s3_key_prefix: str = "certificates"
+    s3_addressing_style: Literal["auto", "path", "virtual"] = "auto"
+    s3_presigned_ttl_seconds: int = Field(default=300, ge=30, le=3600)
+
+    # --- Certificado A1 ICP-Brasil (consumido a partir da Etapa 2) ---
+    signing_pfx_base64: SecretStr
+    signing_pfx_password: SecretStr
+    # Metadados gravados no dicionário da assinatura PAdES (campos /Reason e /Location).
+    signing_reason: str = Field(default="Certificado emitido e assinado digitalmente", max_length=200)
+    signing_location: str | None = Field(default=None, max_length=200)
+    # Gera aviso (healthcheck "expiring_soon") quando faltar menos que N dias para expirar.
+    signing_expiry_warning_days: int = Field(default=30, ge=0, le=365)
+
+    # ------------------------------------------------------------------
+    # Validadores
+    # ------------------------------------------------------------------
+    @field_validator("public_validation_base_url")
+    @classmethod
+    def _validate_public_url(cls, value: str) -> str:
+        value = value.strip().rstrip("/")
+        if not value.startswith(("http://", "https://")):
+            raise ValueError("PUBLIC_VALIDATION_BASE_URL deve começar com http:// ou https://")
+        return value
+
+    @field_validator("database_url")
+    @classmethod
+    def _validate_database_url(cls, value: SecretStr) -> SecretStr:
+        raw = value.get_secret_value().strip()
+        if not raw.startswith(("postgresql://", "postgres://")):
+            raise ValueError("DATABASE_URL deve usar o esquema postgresql:// ou postgres://")
+        return SecretStr(raw)
+
+    @field_validator("s3_endpoint_url", "signing_location", mode="before")
+    @classmethod
+    def _empty_endpoint_is_none(cls, value: object) -> object:
+        # Permite deixar S3_ENDPOINT_URL vazio para usar a AWS S3 padrão.
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator("s3_key_prefix")
+    @classmethod
+    def _validate_key_prefix(cls, value: str) -> str:
+        value = value.strip().strip("/")
+        if not value or ".." in value:
+            raise ValueError("S3_KEY_PREFIX inválido")
+        return value
+
+    @field_validator("signing_pfx_base64")
+    @classmethod
+    def _validate_pfx_base64(cls, value: SecretStr) -> SecretStr:
+        # Variáveis de ambiente costumam trazer quebras de linha; normaliza antes de validar.
+        normalized = _WHITESPACE_RE.sub("", value.get_secret_value())
+        if not normalized:
+            raise ValueError("SIGNING_PFX_BASE64 não pode ser vazio")
+        try:
+            base64.b64decode(normalized, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("SIGNING_PFX_BASE64 não é um Base64 válido") from exc
+        return SecretStr(normalized)
+
+    @model_validator(mode="after")
+    def _cross_validate(self) -> "Settings":
+        if self.db_pool_min_size > self.db_pool_max_size:
+            raise ValueError("DB_POOL_MIN_SIZE não pode ser maior que DB_POOL_MAX_SIZE")
+        if self.app_env == "production":
+            if self.db_ssl in ("disable", "prefer"):
+                raise ValueError("Em produção DB_SSL deve ser require, verify-ca ou verify-full")
+            if not self.public_validation_base_url.startswith("https://"):
+                raise ValueError("Em produção PUBLIC_VALIDATION_BASE_URL deve usar https://")
+        return self
+
+    @property
+    def is_production(self) -> bool:
+        return self.app_env == "production"
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    """Retorna a instância única de configurações (cache em processo)."""
+    return Settings()  # type: ignore[call-arg]

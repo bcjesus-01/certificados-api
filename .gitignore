@@ -1,0 +1,30 @@
+# Segredos e material criptográfico: NUNCA versionar
+.env
+.env.*
+!.env.example
+*.pfx
+*.p12
+*.pem
+*.key
+*.crt
+*.cer
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Editores / SO
+.idea/
+.vscode/
+.DS_Store
+
+# Artefatos locais
+*.zip

@@ -1,0 +1,27 @@
+# --- Web / API ---
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.32,<1.0
+python-multipart>=0.0.12,<1.0
+
+# --- Configuração e validação ---
+pydantic>=2.9,<3.0
+pydantic-settings>=2.6,<3.0
+
+# --- Banco de dados (Supabase / PostgreSQL) ---
+asyncpg>=0.30,<1.0
+
+# --- Object Storage (Cloudflare R2 / AWS S3) ---
+# >=1.36 é necessário para os parâmetros de checksum compatíveis com o R2
+boto3>=1.36,<2.0
+
+# --- Criptografia e assinatura PAdES ---
+pyhanko>=0.25,<1.0
+pyhanko-certvalidator>=0.26.5,<1.0
+cryptography>=43.0.3,<47.0
+# Dependência já trazida pelo pyHanko, declarada porque app/crypto a importa diretamente
+asn1crypto>=1.5,<2.0
+
+# --- Geração de PDF e QR Code (Etapa 3) ---
+reportlab>=4.2,<5.0
+qrcode[pil]>=8.0,<9.0
+pillow>=10.4,<12.0
