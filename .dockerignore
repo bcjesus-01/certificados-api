@@ -1,0 +1,55 @@
+# Segredos e material criptográfico: NUNCA entram na imagem
+.env
+.env.*
+**/.env
+**/.env.*
+*.pfx
+*.p12
+*.pem
+*.key
+*.crt
+*.cer
+**/*.pfx
+**/*.p12
+**/*.pem
+**/*.key
+**/*.crt
+**/*.cer
+
+# Controle de versão e CI
+.git
+.gitignore
+.github
+
+# Ambientes e caches Python
+.venv
+venv
+**/__pycache__
+**/*.py[cod]
+.pytest_cache
+.ruff_cache
+.mypy_cache
+*.egg-info
+
+# Frontend (deploy separado na Vercel)
+frontend
+node_modules
+
+# Não fazem parte da imagem de produção
+tests
+scripts
+sql
+docs
+README.md
+requirements-dev.txt
+pytest.ini
+ruff.toml
+Dockerfile
+.dockerignore
+
+# Artefatos locais
+*.zip
+*.pdf
+.idea
+.vscode
+.DS_Store

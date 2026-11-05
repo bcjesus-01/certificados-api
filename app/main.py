@@ -93,14 +93,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         redoc_url=None,
         openapi_url=None if resolved.is_production else "/openapi.json",
     )
-    # Ordem: o último adicionado é o mais externo. O limite de corpo atua primeiro.
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=resolved.cors_allowed_origins,
-        allow_credentials=False,
-        allow_methods=["GET", "POST"],
-        allow_headers=["X-API-Key", "Content-Type"],
-    )
+    # Ordem: o último adicionado é o mais externo. O CORS fica por fora de tudo para que até as
+    # respostas 413/400 do limitador de corpo carreguem os cabeçalhos CORS (senão o navegador
+    # mostraria só "falha de rede" em vez do erro legível).
     app.add_middleware(
         MaxBodySizeMiddleware,
         max_bytes=resolved.batch_max_body_bytes,
@@ -111,6 +106,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         MaxBodySizeMiddleware,
         max_bytes=resolved.validation_max_upload_bytes + _MULTIPART_OVERHEAD_BYTES,
         path_prefix=f"{resolved.api_v1_prefix}/validate/file",
+    )
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=resolved.allowed_origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST"],
+        allow_headers=["X-API-Key", "Content-Type"],
+        max_age=600,
     )
     app.include_router(health.router)
     app.include_router(certificates.router, prefix=resolved.api_v1_prefix)

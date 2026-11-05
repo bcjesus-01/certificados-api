@@ -1,0 +1,4 @@
+# Dependências de desenvolvimento e CI (não entram na imagem de produção)
+-r requirements.txt
+ruff>=0.16,<0.17
+pytest>=8.3,<10.0

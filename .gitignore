@@ -8,6 +8,7 @@
 *.key
 *.crt
 *.cer
+*.pdf
 
 # Python
 __pycache__/
@@ -28,3 +29,12 @@ dist/
 
 # Artefatos locais
 *.zip
+
+# Frontend (Next.js)
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+next-env.d.ts
+coverage/
+npm-debug.log*

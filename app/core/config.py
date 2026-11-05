@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import re
 from functools import lru_cache
 from typing import Literal
@@ -15,6 +16,47 @@ from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _WHITESPACE_RE = re.compile(r"\s+")
+# esquema://host[:porta] (inclui IPv6 entre colchetes), sem caminho, query ou barra final.
+_ORIGIN_RE = re.compile(r"https?://(?:[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:]+\])(?::\d{1,5})?")
+DEFAULT_DEV_ORIGINS: tuple[str, ...] = ("http://localhost:3000",)
+
+
+def parse_origins(raw: str) -> list[str]:
+    """Converte ``CORS_ORIGINS`` (lista separada por vírgula ou JSON) em origens normalizadas.
+
+    Rejeita ``*`` e qualquer valor que não seja ``esquema://host[:porta]``: origens
+    explícitas são o que impede um site qualquer de consumir a API pelo navegador.
+    """
+    text = raw.strip()
+    if not text:
+        return []
+    items: list[object]
+    if text.startswith("["):
+        try:
+            decoded = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError("CORS_ORIGINS: JSON inválido") from exc
+        if not isinstance(decoded, list):
+            raise ValueError("CORS_ORIGINS: esperado uma lista JSON de strings")
+        items = decoded
+    else:
+        items = list(text.split(","))
+    origins: list[str] = []
+    for item in items:
+        if not isinstance(item, str):
+            raise ValueError("CORS_ORIGINS: todos os itens devem ser strings")
+        origin = item.strip().rstrip("/")
+        if not origin:
+            continue
+        if origin == "*":
+            raise ValueError("CORS_ORIGINS não pode conter '*': liste cada origem explicitamente")
+        if not _ORIGIN_RE.fullmatch(origin):
+            raise ValueError(
+                f"CORS_ORIGINS: origem inválida {origin!r} (use esquema://host[:porta], sem caminho)"
+            )
+        if origin not in origins:
+            origins.append(origin)
+    return origins
 
 
 class Settings(BaseSettings):
@@ -32,7 +74,11 @@ class Settings(BaseSettings):
     app_env: Literal["development", "staging", "production"] = "development"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     api_v1_prefix: str = "/api/v1"
-    cors_allowed_origins: list[str] = Field(default_factory=list)
+    # Origens do portal (Next.js) autorizadas a chamar a API pelo navegador. Aceita lista separada
+    # por vírgula ou JSON. Em desenvolvimento, vazio equivale a http://localhost:3000.
+    cors_origins: str = ""
+    # Nome antigo da variável (Etapas 1 a 5, lista JSON). Mantido para não quebrar .env existentes.
+    cors_allowed_origins: str = ""
     public_validation_base_url: str = Field(
         ..., description="URL base do portal de validação (usada no QR Code)."
     )
@@ -94,6 +140,12 @@ class Settings(BaseSettings):
         if not value.startswith(("http://", "https://")):
             raise ValueError("PUBLIC_VALIDATION_BASE_URL deve começar com http:// ou https://")
         return value
+
+    @field_validator("cors_origins", "cors_allowed_origins")
+    @classmethod
+    def _validate_cors_origins(cls, value: str) -> str:
+        parse_origins(value)  # falha rápido na inicialização se a lista for inválida
+        return value.strip()
 
     @field_validator("database_url")
     @classmethod
@@ -161,7 +213,20 @@ class Settings(BaseSettings):
                 raise ValueError("Em produção PUBLIC_VALIDATION_BASE_URL deve usar https://")
             if self.issuance_api_key is None:
                 raise ValueError("Em produção ISSUANCE_API_KEY é obrigatória")
+            origins = self.allowed_origins
+            if not origins:
+                raise ValueError("Em produção CORS_ORIGINS é obrigatória (origem do portal de validação)")
+            if any(not origin.startswith("https://") for origin in origins):
+                raise ValueError("Em produção todas as origens de CORS_ORIGINS devem usar https://")
         return self
+
+    @property
+    def allowed_origins(self) -> list[str]:
+        """Origens CORS efetivas: ``CORS_ORIGINS``, senão o nome antigo, senão o padrão de dev."""
+        origins = parse_origins(self.cors_origins) or parse_origins(self.cors_allowed_origins)
+        if not origins and not self.is_production:
+            return list(DEFAULT_DEV_ORIGINS)
+        return origins
 
     @property
     def is_production(self) -> bool:
