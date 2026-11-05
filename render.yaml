@@ -1,0 +1,55 @@
+# Render Blueprint: API FastAPI (Docker). Valores com `sync: false` são pedidos no painel e
+# nunca ficam no repositório. Detalhes e ordem de preenchimento: README.md, seção "Render".
+services:
+  - type: web
+    name: certificados-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: free            # troque para starter se não quiser a suspensão por inatividade
+    region: ohio          # Render não tem região no Brasil; mantenha a mais próxima do Supabase
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      # --- Aplicação ---------------------------------------------------------------
+      - key: APP_ENV
+        value: production
+      - key: LOG_LEVEL
+        value: INFO
+      # Valores provisórios até a Vercel gerar o domínio; depois troque pelos definitivos.
+      - key: CORS_ORIGINS
+        value: https://example.com
+      - key: PUBLIC_VALIDATION_BASE_URL
+        value: https://example.com/validar
+      # --- Banco (Supabase, pooler porta 6543) --------------------------------------
+      - key: DATABASE_URL
+        sync: false
+      - key: DB_SSL
+        value: require
+      - key: DB_STATEMENT_CACHE_SIZE
+        value: "0"
+      # --- Storage S3 (Supabase Storage; para Cloudflare R2 troque endpoint/region/estilo) --
+      - key: S3_ENDPOINT_URL
+        sync: false
+      - key: S3_REGION
+        sync: false
+      - key: S3_ADDRESSING_STYLE
+        value: path
+      - key: S3_BUCKET
+        value: certificados
+      - key: S3_ACCESS_KEY_ID
+        sync: false
+      - key: S3_SECRET_ACCESS_KEY
+        sync: false
+      # --- Assinatura e emissão -----------------------------------------------------
+      - key: SIGNING_PFX_BASE64
+        sync: false
+      - key: SIGNING_PFX_PASSWORD
+        sync: false
+      - key: ISSUANCE_API_KEY
+        sync: false
+      # --- Limites ajustados para 512 MB de RAM do plano gratuito -------------------------
+      - key: BATCH_CONCURRENCY
+        value: "2"
+      - key: VALIDATION_CONCURRENCY
+        value: "2"

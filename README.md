@@ -306,6 +306,10 @@ Observações de produção:
 - **Limitação de taxa** (rate limiting) não está na aplicação: configure no Cloud Armor ou no seu WAF.
 - Render e Railway também funcionam: a imagem respeita `$PORT`.
 
+### API no Render (alternativa ao Cloud Run)
+
+O `render.yaml` na raiz descreve o serviço (Docker, `healthCheckPath: /healthz`). No painel do Render: **New → Blueprint**, escolha este repositório e preencha as variáveis marcadas como segredo. A imagem respeita o `$PORT` que o Render injeta. No plano gratuito o serviço é suspenso após um período sem acesso e a primeira requisição seguinte demora (partida a frio); para uso real contínuo, prefira um plano pago.
+
 ### Portal na Vercel
 
 1. Importe o repositório na Vercel e defina **Root Directory** como `frontend`.
