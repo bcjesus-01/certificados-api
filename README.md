@@ -263,13 +263,120 @@ A imagem roda como `appuser` (uid 10001), sem bytecode `.pyc`, com `HEALTHCHECK`
 
 1. **Guardrail de segurança**: falha se houver `.pfx`, `.p12`, `.pem`, `.key` ou `.env` versionado (na árvore e no histórico), ou chave privada embutida em texto.
 2. **Backend**: Python 3.11 com cache de pip, `ruff`, `pytest`, certificado efêmero (gerado e mascarado no log do runner), `smoke_step2`, `smoke_step3` e `smoke_step6`, mais `docker build` e checagem da imagem em modo somente leitura. Não usa nenhum segredo externo.
-3. **Frontend**: `npm run typecheck` e `npm run build`.
+3. **Frontend**: Node 22 com cache do npm, instalação determinística (`npm ci`, a partir do `package-lock.json` versionado), `npm run typecheck` e `npm run build`.
 
 ---
 
-## Deploy
+## Deploy em produção
 
-### API no Google Cloud Run
+A topologia recomendada tem três peças: o **Supabase** (banco e storage), a **API** em contêiner (Render ou Cloud Run) e o **portal** na Vercel. Há uma dependência circular entre API e portal (a API precisa do domínio do portal, e o portal precisa da URL da API), resolvida na ordem abaixo.
+
+### Ordem de provisionamento
+
+1. **Supabase**: execute `sql/001_schema.sql` e `sql/002_issuance.sql`, crie o bucket privado e as chaves S3 (veja a configuração local).
+2. **API**: publique com valores provisórios de `CORS_ORIGINS` e `PUBLIC_VALIDATION_BASE_URL` (qualquer URL `https`, por exemplo `https://example.com`). Em produção a API recusa subir sem origens `https`.
+3. **Portal**: publique na Vercel apontando `NEXT_PUBLIC_API_BASE_URL` para a URL da API.
+4. **Fechamento**: volte à API e troque as duas variáveis provisórias pelo domínio real do portal. Faça isso antes de emitir qualquer certificado, porque o QR Code carrega essa URL.
+
+### API no Render
+
+O `render.yaml` na raiz descreve o serviço (Docker, `healthCheckPath: /healthz`). No painel do Render: **New → Blueprint**, escolha este repositório e preencha as variáveis marcadas como segredo. Alternativa manual: **New → Web Service**, runtime **Docker**, *Root Directory* vazio, *Health Check Path* `/healthz`.
+
+| Variável | Valor em produção |
+| --- | --- |
+| `APP_ENV` | `production` |
+| `DATABASE_URL` | URI do *Transaction pooler* do Supabase (porta `6543`); codifique caracteres especiais da senha |
+| `DB_SSL` / `DB_STATEMENT_CACHE_SIZE` | `require` / `0` |
+| `S3_ENDPOINT_URL` | `https://SEU_PROJECT_REF.supabase.co/storage/v1/s3` |
+| `S3_REGION` / `S3_ADDRESSING_STYLE` | Região do projeto (por exemplo, `sa-east-1`) / `path` |
+| `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | Bucket privado e chaves S3 do Supabase |
+| `SIGNING_PFX_BASE64`, `SIGNING_PFX_PASSWORD` | Certificado A1 e senha (veja "Certificado de assinatura") |
+| `ISSUANCE_API_KEY` | `python -c "import secrets; print(secrets.token_urlsafe(48))"` |
+| `CORS_ORIGINS` | `https://SEU-PORTAL` (sem barra final e sem caminho) |
+| `PUBLIC_VALIDATION_BASE_URL` | `https://SEU-PORTAL/validar` |
+
+Erros comuns nos logs do deploy:
+
+- `PUBLIC_VALIDATION_BASE_URL deve começar com http:// ou https://`: o valor foi colado com texto sobrando; apague o campo inteiro e cole de novo.
+- `SIGNING_PFX_BASE64 não é um Base64 válido`: o valor está cortado ou tem prefixo, aspas ou caracteres extras (veja a validação em "Certificado de assinatura").
+- Deploy que falha mantém a versão anterior no ar; confira `Aplicação pronta (ambiente=production)` nos logs.
+
+No plano gratuito o serviço é suspenso após um período sem acesso, e a primeira requisição seguinte demora (partida a frio). Para uso contínuo, use um plano pago ou um monitor de disponibilidade chamando `/healthz`. O plano gratuito também tem pouca memória: mantenha `BATCH_CONCURRENCY` e `VALIDATION_CONCURRENCY` baixos (o `render.yaml` usa `2`) e emita lotes pequenos.
+
+### Portal na Vercel
+
+1. **Add New → Project** e importe o repositório.
+2. Em *Configure Project*, ao lado de **Root Directory**, clique em **Edit** e selecione `frontend`. O *Framework Preset* deve ser **Next.js**.
+3. Em **Environment Variables**, defina `NEXT_PUBLIC_API_BASE_URL` com a URL pública da API (sem barra final). O build de produção falha sem ela, e a variável é embutida no build: se mudar depois, faça **Redeploy**.
+4. Faça o deploy e copie o domínio final. Use-o em `CORS_ORIGINS` e `PUBLIC_VALIDATION_BASE_URL` da API (o QR Code aponta para `…/validar/<uuid>`).
+5. Domínio próprio: adicione-o na Vercel e inclua também na API (`CORS_ORIGINS` aceita várias origens separadas por vírgula). Defina o domínio definitivo **antes** da emissão oficial.
+
+---
+
+## Operação
+
+### Emitir certificados
+
+As rotas de emissão exigem o cabeçalho `X-API-Key`. Leia a chave sem eco, para que ela não fique no histórico do terminal:
+
+```bash
+API=https://SUA-API
+read -rsp "X-API-Key: " KEY; echo
+
+curl -sS --max-time 180 -X POST "$API/api/v1/certificates/batch" \
+  -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
+  -o resp.json -w "HTTP %{http_code}\n" \
+  -d '{
+    "event": { "event_name": "Nome do evento", "event_date": "2026-11-05", "workload_hours": 4 },
+    "participants": [ { "recipient_name": "Nome Completo" } ]
+  }'
+```
+
+O retorno traz, para cada participante, `verification_url` (o endereço do QR Code, no domínio do portal) e `presigned_url` (link temporário do PDF assinado). Para listas grandes, use `POST /api/v1/certificates/batch-csv`. Para revogar, use `POST /api/v1/certificates/{cert_uuid}/revoke`.
+
+### Certificado de assinatura
+
+- **Sem e-CNPJ ainda**: `python scripts/generate_dev_cert.py --cn "Nome da Instituição" --days 730` gera um certificado institucional. O portal o reconhece como confiável, mas ele **não é ICP-Brasil**: leitores como o Adobe Reader mostram o signatário como desconhecido, e a assinatura não equivale a uma assinatura qualificada.
+- **Colar no provedor sem erro**: gere o par em variáveis do shell, valide e copie para a área de transferência, sem passar pelo terminal:
+
+```bash
+OUT=$(python scripts/generate_dev_cert.py --cn "Nome da Instituição" --days 730 2>/dev/null)
+B64=$(printf '%s\n' "$OUT" | sed -n 's/^SIGNING_PFX_BASE64=//p')
+PW=$(printf '%s\n' "$OUT"  | sed -n 's/^SIGNING_PFX_PASSWORD=//p')
+printf '%s' "$B64" | python3 -c "import base64,sys; d=base64.b64decode(sys.stdin.read(),validate=True); print('base64 ok,', len(d), 'bytes')"
+printf '%s' "$B64" | xclip -selection clipboard   # Wayland: wl-copy
+# cole em SIGNING_PFX_BASE64; depois copie e cole a senha:
+printf '%s' "$PW" | xclip -selection clipboard
+unset OUT B64 PW
+```
+
+- **Rotação para o `.pfx` oficial**: guarde uma cópia do arquivo em local seguro, converta com `base64 -w0 arquivo.pfx | xclip -selection clipboard` e atualize `SIGNING_PFX_BASE64` e `SIGNING_PFX_PASSWORD` no provedor. Confirme nos logs a linha `Certificado de assinatura carregado` com o novo serial.
+- **Efeito da troca**: a consulta por código continua funcionando para certificados antigos, mas a perícia por arquivo só reconhece como confiáveis PDFs assinados com o certificado atual. Faça a troca antes da emissão oficial e reemita o que foi emitido com o certificado provisório.
+
+### Limpar dados de teste
+
+No **SQL Editor** do Supabase, antes da primeira emissão oficial (a auditoria é *append-only*, então os gatilhos são desligados só durante a limpeza):
+
+```sql
+begin;
+alter table public.certificate_audit_log disable trigger certificate_audit_log_no_update_delete;
+alter table public.certificate_audit_log disable trigger certificate_audit_log_no_truncate;
+delete from public.certificate_audit_log;
+delete from public.certificates;
+alter table public.certificate_audit_log enable trigger certificate_audit_log_no_update_delete;
+alter table public.certificate_audit_log enable trigger certificate_audit_log_no_truncate;
+commit;
+```
+
+Depois apague os PDFs de teste no bucket (pasta `certificates/`).
+
+### Rotação da chave de emissão
+
+Gere uma chave nova, atualize `ISSUANCE_API_KEY` no provedor (campo inteiro, sem texto extra) e no seu `.env`. Faça isso sempre que a chave aparecer em log, chat ou captura de tela.
+
+---
+
+## Alternativa de deploy: Google Cloud Run
 
 ```bash
 PROJECT_ID=meu-projeto
@@ -304,18 +411,7 @@ Observações de produção:
 
 - `--allow-unauthenticated` é necessário porque a validação é pública. As rotas de emissão e revogação continuam protegidas pelo `X-API-Key`.
 - **Limitação de taxa** (rate limiting) não está na aplicação: configure no Cloud Armor ou no seu WAF.
-- Render e Railway também funcionam: a imagem respeita `$PORT`.
-
-### API no Render (alternativa ao Cloud Run)
-
-O `render.yaml` na raiz descreve o serviço (Docker, `healthCheckPath: /healthz`). No painel do Render: **New → Blueprint**, escolha este repositório e preencha as variáveis marcadas como segredo. A imagem respeita o `$PORT` que o Render injeta. No plano gratuito o serviço é suspenso após um período sem acesso e a primeira requisição seguinte demora (partida a frio); para uso real contínuo, prefira um plano pago.
-
-### Portal na Vercel
-
-1. Importe o repositório na Vercel e defina **Root Directory** como `frontend`.
-2. Em **Environment Variables**, defina `NEXT_PUBLIC_API_BASE_URL` com a URL do Cloud Run (sem barra final). O build de produção falha sem ela.
-3. Faça o deploy e copie o domínio final (por exemplo, `https://validar.seudominio.com.br`).
-4. Volte à API e ajuste `CORS_ORIGINS` e `PUBLIC_VALIDATION_BASE_URL` para esse domínio (o QR Code aponta para `…/validar/<uuid>`).
+- Railway e outras plataformas de contêiner também funcionam: a imagem respeita `$PORT`.
 
 ---
 
@@ -326,9 +422,3 @@ O `render.yaml` na raiz descreve o serviço (Docker, `healthCheckPath: /healthz`
 - Respostas públicas com `Cache-Control: no-store`.
 - Log de auditoria *append-only* por *triggers* no banco.
 - Upload de validação limitado a 1 MB, lido em memória e descartado ao fim da requisição.
-
----
-
-## Licença
-
-Defina a licença do seu projeto (por exemplo, MIT) em um arquivo `LICENSE`.
